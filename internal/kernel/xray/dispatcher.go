@@ -81,7 +81,22 @@ type LimitDispatcher struct {
 	unlimitedIPs sync.Map // email → *ipCounter
 
 	connCount atomic.Int64 // total active connections tracked by dispatcher
+
+	// links holds live dispatched links so UpdateLimits can interrupt those
+	// of removed users. linksMu is taken before mu, never after.
+	linksMu  sync.Mutex
+	links    map[uint64]trackedLink
+	nextLink uint64
 }
+
+type trackedLink struct {
+	email string
+	link  *transport.Link
+	conn  net.Conn // client connection from the inbound session; may be nil
+}
+
+// errUserRemoved rejects sessions whose user is no longer on this node.
+var errUserRemoved = errors.New("xray: user removed")
 
 // ipCounter tracks IPs for unlimited users without any lock.
 type ipCounter struct {
@@ -116,8 +131,8 @@ func (d *LimitDispatcher) Dispatch(ctx context.Context, dest net.Destination) (*
 		return nil, err
 	}
 
-	if email != "" {
-		d.trackLink(link, email, sourceIP, isTCP)
+	if email != "" && !d.trackLink(ctx, link, email, sourceIP, isTCP) {
+		return nil, errUserRemoved
 	}
 	return link, nil
 }
@@ -128,8 +143,8 @@ func (d *LimitDispatcher) DispatchLink(ctx context.Context, dest net.Destination
 		return err
 	}
 
-	if email != "" {
-		d.trackLink(link, email, sourceIP, isTCP)
+	if email != "" && !d.trackLink(ctx, link, email, sourceIP, isTCP) {
+		return errUserRemoved
 	}
 	return d.innerDisp.DispatchLink(ctx, dest, link)
 }
@@ -146,6 +161,13 @@ func (d *LimitDispatcher) identifyAndCheck(ctx context.Context, dest net.Destina
 	sourceIP = si.Source.Address.IP().String()
 	isTCP = dest.Network == net.Network_TCP
 
+	// A mux connection authenticated before its user was removed keeps
+	// dispatching sub-streams under the old identity.
+	if !d.knownUser(email) {
+		nlog.Core().Debug("xray: rejecting removed user", "email", email, "ip", sourceIP)
+		return "", "", false, errUserRemoved
+	}
+
 	if d.checkDeviceLimit(email, sourceIP, isTCP) {
 		nlog.Core().Debug("xray: device limit exceeded", "email", email, "ip", sourceIP)
 		return "", "", false, errors.New("device limit exceeded for " + email)
@@ -156,19 +178,71 @@ func (d *LimitDispatcher) identifyAndCheck(ctx context.Context, dest net.Destina
 // trackLink records connection lifecycle without mutating xray-core owned
 // transport primitives. This keeps mux/XUDP compatible while still allowing
 // the dispatcher to release device-limit state when the link closes.
-func (d *LimitDispatcher) trackLink(link *transport.Link, email, sourceIP string, isTCP bool) {
+//
+// The link is registered under linksMu after re-checking the user, the same
+// lock UpdateLimits holds while it swaps users and picks links to interrupt,
+// so a link is either rejected here or interrupted by that update. It returns
+// false, with the link already interrupted, when the user was removed.
+func (d *LimitDispatcher) trackLink(ctx context.Context, link *transport.Link, email, sourceIP string, isTCP bool) bool {
 	d.connCount.Add(1)
 
+	var id uint64
 	onClose := func() {
 		if isTCP {
 			d.delConn(email, sourceIP)
 		}
 		d.connCount.Add(-1)
+		d.linksMu.Lock()
+		delete(d.links, id)
+		d.linksMu.Unlock()
 	}
 
 	link.Writer = &closeTrackingWriter{
 		Writer:  link.Writer,
 		onClose: onClose,
+	}
+
+	tl := trackedLink{email: email, link: link}
+	if si := session.InboundFromContext(ctx); si != nil {
+		tl.conn = si.Conn
+	}
+	d.linksMu.Lock()
+	if !d.knownUser(email) {
+		d.linksMu.Unlock()
+		tl.close()
+		return false
+	}
+	if d.links == nil {
+		d.links = make(map[uint64]trackedLink)
+	}
+	d.nextLink++
+	id = d.nextLink
+	d.links[id] = tl
+	d.linksMu.Unlock()
+	return true
+}
+
+// knownUser reports whether email belongs to a current user. Until the
+// kernel supplies users every session is admitted.
+func (d *LimitDispatcher) knownUser(email string) bool {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	if d.emailToUID == nil {
+		return true
+	}
+	_, ok := d.emailToUID[email]
+	return ok
+}
+
+// close interrupts the link and closes the client connection behind it.
+// Links an inbound builds over its own connection (plain VLESS, splice copy)
+// only stop when that connection closes; for a mux sub-stream it is the
+// authenticated mux connection, which ends the removed user's session.
+func (tl trackedLink) close() {
+	common.Interrupt(tl.link.Reader)
+	common.Interrupt(tl.link.Writer)
+	if tl.conn != nil {
+		tl.conn.Close()
 	}
 }
 
@@ -192,12 +266,32 @@ func (d *LimitDispatcher) Close() error {
 
 // ─── Limit management (called by Xray kernel) ──────────────────────────────
 
+// UpdateLimits replaces the user set and interrupts the live links of users
+// that are no longer present: removing a user from the inbound only stops new
+// handshakes, while established connections and mux sessions would go on.
 func (d *LimitDispatcher) UpdateLimits(emailToUID map[string]int, deviceLimits, _ map[string]int) {
+	d.linksMu.Lock()
 	d.mu.Lock()
 	d.emailToUID = emailToUID
 	d.deviceLimits = deviceLimits
 	d.mu.Unlock()
+	var revoked []trackedLink
+	if emailToUID != nil {
+		for _, tl := range d.links {
+			if _, ok := emailToUID[tl.email]; !ok {
+				revoked = append(revoked, tl)
+			}
+		}
+	}
+	d.linksMu.Unlock()
 
+	// Close outside linksMu: closing a link deregisters it.
+	for _, tl := range revoked {
+		tl.close()
+	}
+	if len(revoked) > 0 {
+		nlog.Core().Info("xray: closed connections of removed users", "connections", len(revoked))
+	}
 }
 
 func (d *LimitDispatcher) ResetConns() {
