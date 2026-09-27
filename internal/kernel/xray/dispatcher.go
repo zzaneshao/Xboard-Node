@@ -7,6 +7,7 @@ import (
 	"sort"
 	"sync"
 	"sync/atomic"
+	"time"
 	_ "unsafe"
 
 	xrayDispatcher "github.com/xtls/xray-core/app/dispatcher"
@@ -87,6 +88,10 @@ type LimitDispatcher struct {
 	linksMu  sync.Mutex
 	links    map[uint64]trackedLink
 	nextLink uint64
+
+	globalMu         sync.RWMutex
+	globalDevices    map[int]map[string]bool // userID → IPs online on any node
+	globalLastUpdate time.Time
 }
 
 type trackedLink struct {
@@ -118,61 +123,61 @@ func (ic *ipCounter) aliveIPs() map[string]bool {
 // ─── routing.Dispatcher ──────────────────────────────────────────────────────
 
 func (d *LimitDispatcher) Dispatch(ctx context.Context, dest net.Destination) (*transport.Link, error) {
-	email, sourceIP, isTCP, err := d.identifyAndCheck(ctx, dest)
+	email, sourceIP, err := d.identifyAndCheck(ctx)
 	if err != nil {
 		return nil, err
 	}
 
 	link, err := d.innerDisp.Dispatch(ctx, dest)
 	if err != nil {
-		if email != "" && isTCP {
+		if email != "" {
 			d.delConn(email, sourceIP)
 		}
 		return nil, err
 	}
 
-	if email != "" && !d.trackLink(ctx, link, email, sourceIP, isTCP) {
+	if email != "" && !d.trackLink(ctx, link, email, sourceIP) {
 		return nil, errUserRemoved
 	}
 	return link, nil
 }
 
 func (d *LimitDispatcher) DispatchLink(ctx context.Context, dest net.Destination, link *transport.Link) error {
-	email, sourceIP, isTCP, err := d.identifyAndCheck(ctx, dest)
+	email, sourceIP, err := d.identifyAndCheck(ctx)
 	if err != nil {
 		return err
 	}
 
-	if email != "" && !d.trackLink(ctx, link, email, sourceIP, isTCP) {
+	if email != "" && !d.trackLink(ctx, link, email, sourceIP) {
 		return errUserRemoved
 	}
 	return d.innerDisp.DispatchLink(ctx, dest, link)
 }
 
 // identifyAndCheck extracts user identity from the session context, enforces
-// device limits, and returns the user's email, source IP, and TCP flag.
-// Returns a non-nil error only when the connection should be rejected.
-func (d *LimitDispatcher) identifyAndCheck(ctx context.Context, dest net.Destination) (email, sourceIP string, isTCP bool, err error) {
+// device limits, and returns the user's email and source IP. TCP and UDP
+// links both count toward the device limit. Returns a non-nil error only when
+// the connection should be rejected.
+func (d *LimitDispatcher) identifyAndCheck(ctx context.Context) (email, sourceIP string, err error) {
 	si := session.InboundFromContext(ctx)
 	if si == nil || si.User == nil || len(si.User.Email) == 0 {
-		return "", "", false, nil
+		return "", "", nil
 	}
 	email = si.User.Email
 	sourceIP = si.Source.Address.IP().String()
-	isTCP = dest.Network == net.Network_TCP
 
 	// A mux connection authenticated before its user was removed keeps
 	// dispatching sub-streams under the old identity.
 	if !d.knownUser(email) {
 		nlog.Core().Debug("xray: rejecting removed user", "email", email, "ip", sourceIP)
-		return "", "", false, errUserRemoved
+		return "", "", errUserRemoved
 	}
 
-	if d.checkDeviceLimit(email, sourceIP, isTCP) {
+	if d.checkDeviceLimit(email, sourceIP) {
 		nlog.Core().Debug("xray: device limit exceeded", "email", email, "ip", sourceIP)
-		return "", "", false, errors.New("device limit exceeded for " + email)
+		return "", "", errors.New("device limit exceeded for " + email)
 	}
-	return email, sourceIP, isTCP, nil
+	return email, sourceIP, nil
 }
 
 // trackLink records connection lifecycle without mutating xray-core owned
@@ -183,14 +188,12 @@ func (d *LimitDispatcher) identifyAndCheck(ctx context.Context, dest net.Destina
 // lock UpdateLimits holds while it swaps users and picks links to interrupt,
 // so a link is either rejected here or interrupted by that update. It returns
 // false, with the link already interrupted, when the user was removed.
-func (d *LimitDispatcher) trackLink(ctx context.Context, link *transport.Link, email, sourceIP string, isTCP bool) bool {
+func (d *LimitDispatcher) trackLink(ctx context.Context, link *transport.Link, email, sourceIP string) bool {
 	d.connCount.Add(1)
 
 	var id uint64
 	onClose := func() {
-		if isTCP {
-			d.delConn(email, sourceIP)
-		}
+		d.delConn(email, sourceIP)
 		d.connCount.Add(-1)
 		d.linksMu.Lock()
 		delete(d.links, id)
@@ -294,6 +297,45 @@ func (d *LimitDispatcher) UpdateLimits(emailToUID map[string]int, deviceLimits, 
 	}
 }
 
+// globalDevicesTTL is how long panel-pushed device state stays usable.
+const globalDevicesTTL = 60 * time.Second
+
+// UpdateGlobalDevices stores the IPs the panel reports online per user
+// across all nodes. The map is replaced, never modified in place.
+func (d *LimitDispatcher) UpdateGlobalDevices(users map[int][]string) {
+	devices := make(map[int]map[string]bool, len(users))
+	for uid, ips := range users {
+		set := make(map[string]bool, len(ips))
+		for _, ip := range ips {
+			set[ip] = true
+		}
+		devices[uid] = set
+	}
+	d.globalMu.Lock()
+	d.globalDevices = devices
+	d.globalLastUpdate = time.Now()
+	d.globalMu.Unlock()
+}
+
+// ClearGlobalDevices drops panel device state (WS disconnected).
+func (d *LimitDispatcher) ClearGlobalDevices() {
+	d.globalMu.Lock()
+	d.globalDevices = nil
+	d.globalLastUpdate = time.Time{}
+	d.globalMu.Unlock()
+}
+
+// freshGlobalDevices returns the user's IPs online across nodes, or nil when
+// the panel state is missing or older than globalDevicesTTL.
+func (d *LimitDispatcher) freshGlobalDevices(uid int) map[string]bool {
+	d.globalMu.RLock()
+	defer d.globalMu.RUnlock()
+	if uid == 0 || time.Since(d.globalLastUpdate) > globalDevicesTTL {
+		return nil
+	}
+	return d.globalDevices[uid]
+}
+
 func (d *LimitDispatcher) ResetConns() {
 	d.mu.Lock()
 	d.limitedIPs = make(map[string]map[string]int)
@@ -365,21 +407,19 @@ func (d *LimitDispatcher) GetConnectionState() (aliveIPs map[int]map[string]bool
 // checkDeviceLimit enforces per-user device limits.
 // Fast path: unlimited users use lock-free sync.Map.
 // Slow path: limited users use RWMutex with deterministic IP ordering.
-func (d *LimitDispatcher) checkDeviceLimit(email, sourceIP string, isTCP bool) bool {
+func (d *LimitDispatcher) checkDeviceLimit(email, sourceIP string) bool {
 	d.mu.RLock()
 	limit, hasLimit := d.deviceLimits[email]
 	d.mu.RUnlock()
 
 	// Fast path: no device limit — use lock-free sync.Map.
 	if !hasLimit || limit <= 0 {
-		if isTCP {
-			v, _ := d.unlimitedIPs.LoadOrStore(email, &ipCounter{})
-			ic := v.(*ipCounter)
+		v, _ := d.unlimitedIPs.LoadOrStore(email, &ipCounter{})
+		ic := v.(*ipCounter)
 
-			// Increment IP refcount atomically.
-			rv, _ := ic.ips.LoadOrStore(sourceIP, &atomic.Int64{})
-			rv.(*atomic.Int64).Add(1)
-		}
+		// Increment IP refcount atomically.
+		rv, _ := ic.ips.LoadOrStore(sourceIP, &atomic.Int64{})
+		rv.(*atomic.Int64).Add(1)
 		return false
 	}
 
@@ -390,42 +430,48 @@ func (d *LimitDispatcher) checkDeviceLimit(email, sourceIP string, isTCP bool) b
 	defer d.mu.Unlock()
 
 	ips := d.limitedIPs[email]
+	if !d.admitDevice(ips, d.freshGlobalDevices(d.emailToUID[email]), sourceIP, limit) {
+		return true
+	}
 	if ips == nil {
 		ips = make(map[string]int)
 		d.limitedIPs[email] = ips
 	}
+	ips[sourceIP]++
+	return false
+}
 
-	if ips[sourceIP] > 0 {
-		if isTCP {
-			ips[sourceIP]++
-		}
-		return false
+// admitDevice decides whether sourceIP may connect for a user allowed limit
+// devices. An IP already online here or on another node is kept. Otherwise
+// the user's IPs online on any node plus sourceIP are sorted and the lowest
+// limit of them win, so every node makes the same choice.
+func (d *LimitDispatcher) admitDevice(local map[string]int, global map[string]bool, sourceIP string, limit int) bool {
+	if local[sourceIP] > 0 || global[sourceIP] {
+		return true
+	}
+	online := make(map[string]struct{}, len(local)+len(global))
+	for ip := range local {
+		online[ip] = struct{}{}
+	}
+	for ip := range global {
+		online[ip] = struct{}{}
+	}
+	if len(online) < limit {
+		return true
 	}
 
-	if len(ips) < limit {
-		if isTCP {
-			ips[sourceIP]++
-		}
-		return false
-	}
-
-	// Over limit — deterministic: allow lowest IPs lexicographically.
-	ipList := make([]string, 0, len(ips)+1)
-	for ip := range ips {
+	ipList := make([]string, 0, len(online)+1)
+	for ip := range online {
 		ipList = append(ipList, ip)
 	}
 	ipList = append(ipList, sourceIP)
 	sort.Strings(ipList)
-
 	for i := 0; i < limit && i < len(ipList); i++ {
 		if ipList[i] == sourceIP {
-			if isTCP {
-				ips[sourceIP]++
-			}
-			return false
+			return true
 		}
 	}
-	return true
+	return false
 }
 
 // delConn decrements the IP refcount when a connection closes.
