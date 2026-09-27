@@ -1042,7 +1042,7 @@ func (s *Service) pushReportAsync() {
 	}
 
 	traffic := s.tracker.FlushTraffic()
-	aliveIPs := s.tracker.FlushAliveIPs()
+	aliveIPs := s.reportAliveIPs()
 	online := s.tracker.CurrentOnline()
 	status := monitor.Collect()
 	metrics := s.buildMetrics(status)
@@ -1054,9 +1054,6 @@ func (s *Service) pushReportAsync() {
 			nlog.Core().Warn("failed to push report", "error", err)
 			if len(traffic) > 0 {
 				s.tracker.RestoreTraffic(traffic)
-			}
-			if len(aliveIPs) > 0 {
-				s.tracker.RestoreAliveIPs(aliveIPs)
 			}
 			s.pushBackoff.onFailure()
 			return
@@ -1072,7 +1069,7 @@ func (s *Service) pushReportSync() {
 		return
 	}
 	traffic := s.tracker.FlushTraffic()
-	aliveIPs := s.tracker.FlushAliveIPs()
+	aliveIPs := s.reportAliveIPs()
 	online := s.tracker.CurrentOnline()
 	status := monitor.Collect()
 	metrics := s.buildMetrics(status)
@@ -1194,18 +1191,30 @@ func computeUserHash(users []model.UserSpec) string {
 
 // ─── Device management ──────────────────────────────────────────────────
 
-// sendDeviceBatch reports local device snapshot to panel via WS.
+// devicesViaPush reports whether device snapshots go over the WS device
+// channel, which the panel treats as the node's complete device set.
+func (s *Service) devicesViaPush() bool {
+	return s.sink.SupportsDeviceReports() && s.wsClient != nil && s.wsClient.IsConnected()
+}
+
+// reportAliveIPs returns the alive IPs a panel report carries: none while the
+// WS device channel is up, the full current set otherwise.
+func (s *Service) reportAliveIPs() map[int][]string {
+	if s.devicesViaPush() {
+		return nil
+	}
+	return s.tracker.AliveIPs()
+}
+
+// sendDeviceBatch reports the full local device snapshot to the panel via WS,
+// unchanged or not. The panel forgets devices it has not heard about for five
+// minutes and pushes global device state back only after a device report.
 func (s *Service) sendDeviceBatch() {
-	if s.wsClient == nil || !s.wsClient.IsConnected() {
+	if !s.devicesViaPush() {
 		return
 	}
 
-	devices := s.tracker.FlushAliveIPs()
-	// FlushAliveIPs returns nil if no changes since last flush
-	if devices == nil {
-		nlog.Core().Debug("device snapshot unchanged, skipping")
-		return
-	}
+	devices := s.tracker.AliveIPs()
 	s.sink.ReportDevices(s.wsClient, devices)
 	nlog.Core().Debug("device snapshot sent", "users", len(devices))
 }
