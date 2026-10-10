@@ -110,6 +110,54 @@ type Kernel interface {
 // defaults (10s + 30s + 10s), plus slack.
 const DeviceEchoWindow = 60 * time.Second
 
+// AdmitDevice decides whether sourceIP may connect for a user allowed limit
+// devices. local holds the user's IPs online on this node and elsewhere those
+// online on other nodes. An IP already online is kept; a new IP is admitted
+// only while fewer than limit are online, first come first served.
+func AdmitDevice(local map[string]int, elsewhere map[string]bool, sourceIP string, limit int) bool {
+	if local[sourceIP] > 0 || elsewhere[sourceIP] {
+		return true
+	}
+	online := len(local)
+	for ip := range elsewhere {
+		if local[ip] == 0 {
+			online++
+		}
+	}
+	return online < limit
+}
+
+// OverLimitDevices returns the local IPs to disconnect when the user's IPs
+// online on all nodes exceed limit. Two nodes can each admit a device before
+// the panel tells them about the other, and neither knows which came first,
+// so every node keeps the limit lowest-sorting IPs: the nodes agree on the
+// survivors without talking to each other.
+func OverLimitDevices(local map[string]int, elsewhere map[string]bool, limit int) []string {
+	if limit <= 0 || len(local) == 0 {
+		return nil
+	}
+	all := make([]string, 0, len(local)+len(elsewhere))
+	for ip := range local {
+		all = append(all, ip)
+	}
+	for ip := range elsewhere {
+		if local[ip] == 0 {
+			all = append(all, ip)
+		}
+	}
+	if len(all) <= limit {
+		return nil
+	}
+	sort.Strings(all)
+	var over []string
+	for _, ip := range all[limit:] {
+		if local[ip] > 0 {
+			over = append(over, ip)
+		}
+	}
+	return over
+}
+
 // ComputeHash returns a hash of config + user identities that would
 // require a kernel restart/reconstruction if changed.
 func ComputeHash(nc *model.NodeSpec, users []model.UserSpec) string {

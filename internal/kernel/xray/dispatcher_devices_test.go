@@ -186,3 +186,59 @@ func TestLimitDispatcher_CountsDepartedDeviceStillOnlineElsewhere(t *testing.T) 
 		t.Error("a second device was admitted while the first is online on another node")
 	}
 }
+
+// Two nodes can each admit a device before the panel tells them about the
+// other. Once global state shows the user over the limit, every node keeps
+// the same lowest-sorting IPs and disconnects its other devices.
+func TestLimitDispatcher_GlobalStateDisconnectsDeviceOverLimit(t *testing.T) {
+	ld, email := limitedDispatcher(1)
+	local, err := dispatchFrom(ld, email, "9.9.9.9")
+	if err != nil {
+		t.Fatalf("first device rejected: %v", err)
+	}
+	ld.UpdateGlobalDevices(map[int][]string{1: {"1.1.1.1", "9.9.9.9"}})
+
+	if !local.interrupted() {
+		t.Fatal("device over the limit stayed connected")
+	}
+	if alive, _ := ld.GetConnectionState(); len(alive[1]) != 0 {
+		t.Errorf("disconnected device still reported online: %v", alive[1])
+	}
+	if _, err := dispatchFrom(ld, email, "9.9.9.9"); err == nil {
+		t.Error("disconnected device was admitted again while the slot is used on another node")
+	}
+}
+
+func TestLimitDispatcher_GlobalStateKeepsDevicesWithinLimit(t *testing.T) {
+	for name, tc := range map[string]struct {
+		limit  int
+		local  string
+		global []string
+	}{
+		"survivor on this node":  {1, "1.1.1.1", []string{"1.1.1.1", "9.9.9.9"}},
+		"total within the limit": {2, "9.9.9.9", []string{"1.1.1.1", "9.9.9.9"}},
+		"only this node":         {1, "9.9.9.9", []string{"9.9.9.9"}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			ld, email := limitedDispatcher(tc.limit)
+			local, _ := dispatchFrom(ld, email, tc.local)
+			ld.UpdateGlobalDevices(map[int][]string{1: tc.global})
+			if local.interrupted() {
+				t.Error("device within the limit was disconnected")
+			}
+		})
+	}
+}
+
+// The echo of a device that just left this node is not a second device.
+func TestLimitDispatcher_GlobalEchoDoesNotDisconnectNextDevice(t *testing.T) {
+	ld, email := limitedDispatcher(1)
+	old, _ := dispatchFrom(ld, email, "1.1.1.1")
+	old.close()
+	next, _ := dispatchFrom(ld, email, "9.9.9.9")
+	ld.UpdateGlobalDevices(map[int][]string{1: {"1.1.1.1", "9.9.9.9"}})
+
+	if next.interrupted() {
+		t.Error("device disconnected because of this node's own stale report")
+	}
+}

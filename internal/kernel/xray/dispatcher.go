@@ -97,9 +97,11 @@ type LimitDispatcher struct {
 }
 
 type trackedLink struct {
-	email string
-	link  *transport.Link
-	conn  net.Conn // client connection from the inbound session; may be nil
+	email    string
+	sourceIP string
+	limited  bool // counted toward the user's device limit
+	link     *transport.Link
+	conn     net.Conn // client connection from the inbound session; may be nil
 }
 
 // errUserRemoved rejects sessions whose user is no longer on this node.
@@ -209,7 +211,7 @@ func (d *LimitDispatcher) trackLink(ctx context.Context, link *transport.Link, e
 		onClose: onClose,
 	}
 
-	tl := trackedLink{email: email, link: link}
+	tl := trackedLink{email: email, sourceIP: sourceIP, limited: limited, link: link}
 	if si := session.InboundFromContext(ctx); si != nil {
 		tl.conn = si.Conn
 	}
@@ -306,7 +308,8 @@ func (d *LimitDispatcher) UpdateLimits(emailToUID map[string]int, deviceLimits, 
 const globalDevicesTTL = 60 * time.Second
 
 // UpdateGlobalDevices stores the IPs the panel reports online per user
-// across all nodes. The map is replaced, never modified in place.
+// across all nodes, then disconnects local devices the new state shows to be
+// over a user's limit. The map is replaced, never modified in place.
 func (d *LimitDispatcher) UpdateGlobalDevices(users map[int][]string) {
 	devices := make(map[int]map[string]bool, len(users))
 	for uid, ips := range users {
@@ -320,6 +323,41 @@ func (d *LimitDispatcher) UpdateGlobalDevices(users map[int][]string) {
 	d.globalDevices = devices
 	d.globalLastUpdate = time.Now()
 	d.globalMu.Unlock()
+	d.disconnectOverLimit()
+}
+
+// disconnectOverLimit closes the links of local devices that put a user over
+// the device limit. Admission cannot prevent this alone: two nodes can each
+// admit a new device before the panel tells them about the other.
+func (d *LimitDispatcher) disconnectOverLimit() {
+	d.linksMu.Lock()
+	d.mu.RLock()
+	over := make(map[string]map[string]bool)
+	for email, local := range d.limitedIPs {
+		for _, ip := range kernel.OverLimitDevices(local, d.devicesElsewhere(email), d.deviceLimits[email]) {
+			if over[email] == nil {
+				over[email] = make(map[string]bool)
+			}
+			over[email][ip] = true
+			nlog.Core().Info("xray: disconnecting device over the limit",
+				"user", d.emailToUID[email], "ip", ip, "limit", d.deviceLimits[email])
+		}
+	}
+	d.mu.RUnlock()
+	var revoked []trackedLink
+	if len(over) > 0 {
+		for _, tl := range d.links {
+			if tl.limited && over[tl.email][tl.sourceIP] {
+				revoked = append(revoked, tl)
+			}
+		}
+	}
+	d.linksMu.Unlock()
+
+	// Close outside linksMu: closing a link deregisters it.
+	for _, tl := range revoked {
+		tl.close()
+	}
 }
 
 // ClearGlobalDevices drops panel device state (WS disconnected).
@@ -476,7 +514,7 @@ func (d *LimitDispatcher) checkDeviceLimit(email, sourceIP string) (rejected, li
 	defer d.mu.Unlock()
 
 	ips := d.limitedIPs[email]
-	if !admitDevice(ips, d.devicesElsewhere(email), sourceIP, limit) {
+	if !kernel.AdmitDevice(ips, d.devicesElsewhere(email), sourceIP, limit) {
 		return true, true
 	}
 	if ips == nil {
@@ -485,22 +523,6 @@ func (d *LimitDispatcher) checkDeviceLimit(email, sourceIP string) (rejected, li
 	}
 	ips[sourceIP]++
 	return false, true
-}
-
-// admitDevice decides whether sourceIP may connect for a user allowed limit
-// devices. An IP already online here or on another node is kept; a new IP is
-// admitted only while fewer than limit are online, first come first served.
-func admitDevice(local map[string]int, elsewhere map[string]bool, sourceIP string, limit int) bool {
-	if local[sourceIP] > 0 || elsewhere[sourceIP] {
-		return true
-	}
-	online := len(local)
-	for ip := range elsewhere {
-		if local[ip] == 0 {
-			online++
-		}
-	}
-	return online < limit
 }
 
 // delConn decrements the IP refcount when a connection closes. limited is

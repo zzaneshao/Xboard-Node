@@ -172,9 +172,11 @@ func NewConnTracker(_ int) *ConnTracker {
 
 // trackedRef is a live connection as seen by force-close and revocation.
 type trackedRef struct {
-	conn    io.Closer
-	user    string // metadata.User at admission
-	managed bool   // admitted on the managed inbound
+	conn     io.Closer
+	user     string // metadata.User at admission
+	uid      int    // panel user ID, 0 when unknown
+	sourceIP string
+	managed  bool // admitted on the managed inbound
 }
 
 // SetManagedInbound names the node inbound whose connections must belong to a
@@ -226,7 +228,8 @@ func (t *ConnTracker) SetUserMap(m map[string]int) {
 	}
 }
 
-// UpdateGlobalDevices syncs global device state from panel.
+// UpdateGlobalDevices syncs global device state from panel, then disconnects
+// local devices the new state shows to be over a user's limit.
 func (t *ConnTracker) UpdateGlobalDevices(users map[int][]string) {
 	t.globalMu.Lock()
 	t.globalDevices = make(map[int]map[string]bool, len(users))
@@ -240,6 +243,7 @@ func (t *ConnTracker) UpdateGlobalDevices(users map[int][]string) {
 	t.globalLastUpdate = time.Now()
 	t.globalMu.Unlock()
 	nlog.Core().Debug("global device state updated", "users", len(users))
+	t.disconnectOverLimit()
 }
 
 // ClearGlobalDevices resets global device state (on WS disconnect).
@@ -302,7 +306,7 @@ func (t *ConnTracker) RoutedConnection(
 		limiter:  lim,
 		ctx:      ctx,
 	}
-	if !t.register(connID, tracked, metadata) {
+	if !t.register(connID, tracked, metadata, uid, sourceIP) {
 		nlog.Core().Debug("singbox: rejecting connection from removed user", "user", uuid, "ip", sourceIP)
 		tracked.Close()
 		return conn
@@ -357,7 +361,7 @@ func (t *ConnTracker) RoutedPacketConnection(
 		limiter:    lim,
 		ctx:        ctx,
 	}
-	if !t.register(connID, tracked, metadata) {
+	if !t.register(connID, tracked, metadata, uid, sourceIP) {
 		nlog.Core().Debug("singbox: rejecting UDP connection from removed user", "user", uuid, "ip", sourceIP)
 		tracked.Close()
 		return conn
@@ -369,14 +373,14 @@ func (t *ConnTracker) RoutedPacketConnection(
 // for a user missing from the current user map. It shares usersMu with
 // SetUserMap, so every connection is either rejected here or seen by the next
 // revocation.
-func (t *ConnTracker) register(connID string, conn io.Closer, metadata adapter.InboundContext) bool {
+func (t *ConnTracker) register(connID string, conn io.Closer, metadata adapter.InboundContext, uid int, sourceIP string) bool {
 	t.usersMu.Lock()
 	defer t.usersMu.Unlock()
 	managed := t.managedInbound != "" && metadata.Inbound == t.managedInbound
 	if _, ok := t.uuidMap[metadata.User]; managed && !ok {
 		return false
 	}
-	t.connMap[connID] = trackedRef{conn: conn, user: metadata.User, managed: managed}
+	t.connMap[connID] = trackedRef{conn: conn, user: metadata.User, uid: uid, sourceIP: sourceIP, managed: managed}
 	return true
 }
 
@@ -385,49 +389,89 @@ const globalDevicesTTL = 60 * time.Second
 
 // checkDeviceGate rejects connections exceeding device limit. An IP already
 // online here or on another node is kept; a new IP is admitted only while
-// fewer than limit are online, first come first served. Devices on other
-// nodes come from the panel's global state while it is fresh. That state
-// includes the devices this node reported and trails them, so an IP that left
-// this node less than kernel.DeviceEchoWindow before the state arrived is
-// taken for an echo of this node's own report and not counted.
+// fewer than limit are online, first come first served.
 func (t *ConnTracker) checkDeviceGate(us *userStats, userID int, sourceIP string, limit int) bool {
 	if us == nil || limit <= 0 {
 		return false
 	}
 
-	t.globalMu.RLock()
-	received := t.globalLastUpdate
-	globalIPs := t.globalDevices[userID]
-	t.globalMu.RUnlock()
-	if time.Since(received) > globalDevicesTTL {
-		globalIPs = nil
-	}
-
 	us.mu.RLock()
 	defer us.mu.RUnlock()
-
-	if us.ips[sourceIP] > 0 {
-		return false
-	}
-	online := len(us.ips)
-	for ip := range globalIPs {
-		if us.ips[ip] > 0 {
-			continue
-		}
-		if left, ok := us.departed[ip]; ok && received.Before(left.Add(kernel.DeviceEchoWindow)) {
-			continue
-		}
-		if ip == sourceIP {
-			return false
-		}
-		online++
-	}
-	if online < limit {
+	if kernel.AdmitDevice(us.ips, t.devicesElsewhere(us, userID), sourceIP, limit) {
 		return false
 	}
 	nlog.Core().Debug("device limit: over limit, rejecting",
-		"userID", userID, "ip", sourceIP, "online", online, "limit", limit)
+		"userID", userID, "ip", sourceIP, "localIPs", len(us.ips), "limit", limit)
 	return true
+}
+
+// devicesElsewhere returns the user's IPs online on other nodes, from the
+// panel's global state while it is fresh. That state includes the devices
+// this node reported and trails them, so an IP that left this node less than
+// kernel.DeviceEchoWindow before the state arrived is taken for an echo of
+// this node's own report and left out. The caller holds us.mu.
+func (t *ConnTracker) devicesElsewhere(us *userStats, userID int) map[string]bool {
+	t.globalMu.RLock()
+	received := t.globalLastUpdate
+	global := t.globalDevices[userID]
+	t.globalMu.RUnlock()
+	if time.Since(received) > globalDevicesTTL {
+		return nil
+	}
+	if len(global) == 0 || len(us.departed) == 0 {
+		return global
+	}
+	elsewhere := make(map[string]bool, len(global))
+	for ip := range global {
+		if left, ok := us.departed[ip]; ok && received.Before(left.Add(kernel.DeviceEchoWindow)) {
+			continue
+		}
+		elsewhere[ip] = true
+	}
+	return elsewhere
+}
+
+// disconnectOverLimit closes the connections of local devices that put a
+// user over the device limit. Admission cannot prevent this alone: two nodes
+// can each admit a new device before the panel tells them about the other.
+func (t *ConnTracker) disconnectOverLimit() {
+	dlf := t.deviceLimitFunc.Load()
+	if dlf == nil {
+		return
+	}
+	t.usersMu.RLock()
+	over := make(map[int]map[string]bool)
+	for uuid, uid := range t.uuidMap {
+		limit, hasLimit := (*dlf)(uuid)
+		us := t.users[uid]
+		if !hasLimit || us == nil {
+			continue
+		}
+		us.mu.RLock()
+		ips := kernel.OverLimitDevices(us.ips, t.devicesElsewhere(us, uid), limit)
+		us.mu.RUnlock()
+		for _, ip := range ips {
+			if over[uid] == nil {
+				over[uid] = make(map[string]bool)
+			}
+			over[uid][ip] = true
+			nlog.Core().Info("singbox: disconnecting device over the limit", "user", uid, "ip", ip, "limit", limit)
+		}
+	}
+	var revoked []io.Closer
+	if len(over) > 0 {
+		for _, ref := range t.connMap {
+			if over[ref.uid][ref.sourceIP] {
+				revoked = append(revoked, ref.conn)
+			}
+		}
+	}
+	t.usersMu.RUnlock()
+
+	// Close outside the lock: Close removes the conn from connMap.
+	for _, conn := range revoked {
+		conn.Close()
+	}
 }
 
 func (t *ConnTracker) nextID() string {

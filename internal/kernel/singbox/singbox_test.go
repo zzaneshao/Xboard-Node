@@ -264,3 +264,59 @@ func TestConnTrackerCountsDepartedDeviceStillOnlineElsewhere(t *testing.T) {
 		t.Error("a second device was admitted while the first is online on another node")
 	}
 }
+
+// Two nodes can each admit a device before the panel tells them about the
+// other. Once global state shows the user over the limit, every node keeps
+// the same lowest-sorting IPs and disconnects its other devices.
+func TestConnTrackerGlobalStateDisconnectsDeviceOverLimit(t *testing.T) {
+	tracker := limitedTracker(1)
+	base := &testConn{}
+	tracker.RoutedConnection(context.Background(), base, testInboundContext("uuid-1", "9.9.9.9"), nil, nil)
+	tracker.UpdateGlobalDevices(map[int][]string{1: {"1.1.1.1", "9.9.9.9"}})
+
+	if !base.closed {
+		t.Fatal("device over the limit stayed connected")
+	}
+	if _, alive, _ := tracker.GetUserTraffic(); len(alive[1]) != 0 {
+		t.Errorf("disconnected device still reported online: %v", alive[1])
+	}
+	if _, ok := admitted(tracker, "9.9.9.9"); ok {
+		t.Error("disconnected device was admitted again while the slot is used on another node")
+	}
+}
+
+func TestConnTrackerGlobalStateKeepsDevicesWithinLimit(t *testing.T) {
+	for name, tc := range map[string]struct {
+		limit  int
+		local  string
+		global []string
+	}{
+		"survivor on this node":  {1, "1.1.1.1", []string{"1.1.1.1", "9.9.9.9"}},
+		"total within the limit": {2, "9.9.9.9", []string{"1.1.1.1", "9.9.9.9"}},
+		"only this node":         {1, "9.9.9.9", []string{"9.9.9.9"}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			tracker := limitedTracker(tc.limit)
+			base := &testConn{}
+			tracker.RoutedConnection(context.Background(), base, testInboundContext("uuid-1", tc.local), nil, nil)
+			tracker.UpdateGlobalDevices(map[int][]string{1: tc.global})
+			if base.closed {
+				t.Error("device within the limit was disconnected")
+			}
+		})
+	}
+}
+
+// The echo of a device that just left this node is not a second device.
+func TestConnTrackerGlobalEchoDoesNotDisconnectNextDevice(t *testing.T) {
+	tracker := limitedTracker(1)
+	old, _ := admitted(tracker, "1.1.1.1")
+	old.Close()
+	base := &testConn{}
+	tracker.RoutedConnection(context.Background(), base, testInboundContext("uuid-1", "9.9.9.9"), nil, nil)
+	tracker.UpdateGlobalDevices(map[int][]string{1: {"1.1.1.1", "9.9.9.9"}})
+
+	if base.closed {
+		t.Error("device disconnected because of this node's own stale report")
+	}
+}
