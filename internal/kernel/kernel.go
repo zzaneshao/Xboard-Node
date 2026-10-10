@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"time"
 
 	"github.com/cedar2025/xboard-node/internal/model"
 	"golang.org/x/time/rate"
@@ -102,6 +103,12 @@ type Kernel interface {
 	// ClearGlobalDevices clears the global device state (on WS disconnect).
 	ClearGlobalDevices()
 }
+
+// DeviceEchoWindow bounds how long after a device leaves a node the panel's
+// global device state can still list it only because this node reported it:
+// one tracker tick, one device report interval and one panel push, at their
+// defaults (10s + 30s + 10s), plus slack.
+const DeviceEchoWindow = 60 * time.Second
 
 // ComputeHash returns a hash of config + user identities that would
 // require a kernel restart/reconstruction if changed.

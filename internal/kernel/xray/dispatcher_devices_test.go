@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cedar2025/xboard-node/internal/kernel"
 	"github.com/cedar2025/xboard-node/internal/model"
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/protocol"
@@ -93,4 +94,95 @@ func TestXrayGlobalDevicesLimitNewDevices(t *testing.T) {
 
 	x.ClearGlobalDevices()
 	requireRotationEcho(t, addr, user.UUID, target).Close()
+}
+
+func dispatchFrom(ld *LimitDispatcher, email, ip string) (*testLink, error) {
+	l := newTestLink()
+	return l, ld.DispatchLink(userContextFrom(email, ip), tcpDest, l.link)
+}
+
+func (l *testLink) close() { l.link.Writer.(interface{ Close() error }).Close() }
+
+// A user first seen without a device limit keeps an entry in the unlimited
+// table; connections admitted after a limit is set must still be released.
+func TestLimitDispatcher_ReleasesDevicesOfUserWhoGainedLimit(t *testing.T) {
+	ld, _ := newRevocationDispatcher()
+	email := userEmail(1)
+	ld.UpdateLimits(map[string]int{email: 1}, map[string]int{}, nil)
+	unlimited, _ := dispatchFrom(ld, email, "1.1.1.1")
+	unlimited.close()
+
+	ld.UpdateLimits(map[string]int{email: 1}, map[string]int{email: 1}, nil)
+	limited, err := dispatchFrom(ld, email, "1.1.1.1")
+	if err != nil {
+		t.Fatalf("first device rejected: %v", err)
+	}
+	limited.close()
+
+	if alive, _ := ld.GetConnectionState(); len(alive[1]) != 0 {
+		t.Errorf("devices still reported online after every connection closed: %v", alive[1])
+	}
+	if _, err := dispatchFrom(ld, email, "2.2.2.2"); err != nil {
+		t.Errorf("new device rejected although none is online: %v", err)
+	}
+}
+
+func TestLimitDispatcher_ReleasesDevicesOfUserWhoLostLimit(t *testing.T) {
+	ld, email := limitedDispatcher(1)
+	limited, _ := dispatchFrom(ld, email, "1.1.1.1")
+
+	ld.UpdateLimits(map[string]int{email: 1}, map[string]int{}, nil)
+	unlimited, _ := dispatchFrom(ld, email, "3.3.3.3")
+	limited.close()
+	unlimited.close()
+
+	if alive, _ := ld.GetConnectionState(); len(alive[1]) != 0 {
+		t.Errorf("devices still reported online after every connection closed: %v", alive[1])
+	}
+}
+
+// Device slots are first come, first served: once the limit is reached a new
+// IP is rejected whatever its sort order.
+func TestLimitDispatcher_FullLimitRejectsLowerSortingIP(t *testing.T) {
+	ld, email := limitedDispatcher(1)
+	if _, err := dispatchFrom(ld, email, "9.9.9.9"); err != nil {
+		t.Fatalf("first device rejected: %v", err)
+	}
+	if _, err := dispatchFrom(ld, email, "1.1.1.1"); err == nil {
+		t.Error("a second device was admitted over the limit")
+	}
+
+	ld, email = limitedDispatcher(1)
+	ld.UpdateGlobalDevices(map[int][]string{1: {"5.5.5.5"}})
+	if _, err := dispatchFrom(ld, email, "1.1.1.1"); err == nil {
+		t.Error("a second device was admitted while the slot is used on another node")
+	}
+}
+
+// The panel's global state includes the devices this node reported itself,
+// and trails them: a device that just left this node must not hold its slot
+// against the same user's next IP (Wi-Fi to cellular).
+func TestLimitDispatcher_IgnoresGlobalEchoOfDepartedDevice(t *testing.T) {
+	ld, email := limitedDispatcher(1)
+	old, _ := dispatchFrom(ld, email, "1.1.1.1")
+	ld.UpdateGlobalDevices(map[int][]string{1: {"1.1.1.1"}})
+	old.close()
+
+	if _, err := dispatchFrom(ld, email, "2.2.2.2"); err != nil {
+		t.Errorf("new IP rejected because of this node's own stale report: %v", err)
+	}
+}
+
+// Global state received well after the device left here no longer echoes
+// this node's report: the device is online on another node.
+func TestLimitDispatcher_CountsDepartedDeviceStillOnlineElsewhere(t *testing.T) {
+	ld, email := limitedDispatcher(1)
+	old, _ := dispatchFrom(ld, email, "1.1.1.1")
+	old.close()
+	ld.departed[email]["1.1.1.1"] = time.Now().Add(-2 * kernel.DeviceEchoWindow)
+	ld.UpdateGlobalDevices(map[int][]string{1: {"1.1.1.1"}})
+
+	if _, err := dispatchFrom(ld, email, "2.2.2.2"); err == nil {
+		t.Error("a second device was admitted while the first is online on another node")
+	}
 }

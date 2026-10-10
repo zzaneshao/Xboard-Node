@@ -4,7 +4,6 @@ import (
 	"context"
 	"io"
 	"net"
-	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -15,6 +14,7 @@ import (
 	N "github.com/sagernet/sing/common/network"
 	"golang.org/x/time/rate"
 
+	"github.com/cedar2025/xboard-node/internal/kernel"
 	"github.com/cedar2025/xboard-node/internal/nlog"
 )
 
@@ -34,9 +34,10 @@ type userStats struct {
 	upload   atomic.Int64
 	download atomic.Int64
 
-	mu        sync.RWMutex   // RWMutex for concurrent reads
-	ips       map[string]int // sourceIP → refcount (number of active conns from that IP)
-	connCount int            // total active connections
+	mu        sync.RWMutex         // RWMutex for concurrent reads
+	ips       map[string]int       // sourceIP → refcount (number of active conns from that IP)
+	connCount int                  // total active connections
+	departed  map[string]time.Time // sourceIP → when it last went offline here
 }
 
 // addConn registers a new connection from sourceIP.
@@ -54,8 +55,25 @@ func (u *userStats) removeConn(sourceIP string) {
 	u.ips[sourceIP]--
 	if u.ips[sourceIP] <= 0 {
 		delete(u.ips, sourceIP)
+		u.markDeparted(sourceIP, time.Now())
 	}
 	u.mu.Unlock()
+}
+
+// markDeparted records that sourceIP just went offline here and forgets
+// departures too old to match any global state that is still fresh. The
+// caller holds u.mu.
+func (u *userStats) markDeparted(sourceIP string, now time.Time) {
+	if u.departed == nil {
+		u.departed = make(map[string]time.Time)
+	}
+	cutoff := now.Add(-kernel.DeviceEchoWindow - globalDevicesTTL)
+	for ip, left := range u.departed {
+		if left.Before(cutoff) {
+			delete(u.departed, ip)
+		}
+	}
+	u.departed[sourceIP] = now
 }
 
 // distinctIPs returns the number of distinct IPs currently connected.
@@ -362,86 +380,53 @@ func (t *ConnTracker) register(connID string, conn io.Closer, metadata adapter.I
 	return true
 }
 
-// checkDeviceGate rejects connections exceeding device limit.
-// Strategy: merge local + global state when fresh; local-only when stale.
+// globalDevicesTTL is how long panel-pushed device state stays usable.
+const globalDevicesTTL = 60 * time.Second
+
+// checkDeviceGate rejects connections exceeding device limit. An IP already
+// online here or on another node is kept; a new IP is admitted only while
+// fewer than limit are online, first come first served. Devices on other
+// nodes come from the panel's global state while it is fresh. That state
+// includes the devices this node reported and trails them, so an IP that left
+// this node less than kernel.DeviceEchoWindow before the state arrived is
+// taken for an echo of this node's own report and not counted.
 func (t *ConnTracker) checkDeviceGate(us *userStats, userID int, sourceIP string, limit int) bool {
 	if us == nil || limit <= 0 {
 		return false
 	}
 
-	us.mu.RLock()
-	localIPs := make(map[string]bool, len(us.ips))
-	for ip := range us.ips {
-		localIPs[ip] = true
-	}
-	localCount := len(us.ips)
-	us.mu.RUnlock()
-
-	// Already known locally
-	if localIPs[sourceIP] {
-		return false
-	}
-
-	// Check global state freshness
 	t.globalMu.RLock()
-	globalStale := time.Since(t.globalLastUpdate) > 60*time.Second
+	received := t.globalLastUpdate
 	globalIPs := t.globalDevices[userID]
 	t.globalMu.RUnlock()
-
-	// Stale or missing global state → local-only check
-	if globalStale || globalIPs == nil {
-		if localCount < limit {
-			return false
-		}
-		ipList := make([]string, 0, localCount+1)
-		for ip := range localIPs {
-			ipList = append(ipList, ip)
-		}
-		ipList = append(ipList, sourceIP)
-		sort.Strings(ipList)
-		for i := 0; i < limit && i < len(ipList); i++ {
-			if ipList[i] == sourceIP {
-				return false
-			}
-		}
-		nlog.Core().Debug("device limit: local over limit, rejecting",
-			"userID", userID, "ip", sourceIP, "localIPs", localCount, "limit", limit)
-		return true
+	if time.Since(received) > globalDevicesTTL {
+		globalIPs = nil
 	}
 
-	// Known globally (from other node)
-	if globalIPs[sourceIP] {
+	us.mu.RLock()
+	defer us.mu.RUnlock()
+
+	if us.ips[sourceIP] > 0 {
 		return false
 	}
-
-	// Merge local + global
-	allIPs := make(map[string]bool)
-	for ip := range localIPs {
-		allIPs[ip] = true
-	}
+	online := len(us.ips)
 	for ip := range globalIPs {
-		allIPs[ip] = true
-	}
-
-	if len(allIPs) < limit {
-		return false
-	}
-
-	// Over limit → lexicographic selection
-	ipList := make([]string, 0, len(allIPs)+1)
-	for ip := range allIPs {
-		ipList = append(ipList, ip)
-	}
-	ipList = append(ipList, sourceIP)
-	sort.Strings(ipList)
-
-	for i := 0; i < limit && i < len(ipList); i++ {
-		if ipList[i] == sourceIP {
+		if us.ips[ip] > 0 {
+			continue
+		}
+		if left, ok := us.departed[ip]; ok && received.Before(left.Add(kernel.DeviceEchoWindow)) {
+			continue
+		}
+		if ip == sourceIP {
 			return false
 		}
+		online++
 	}
-	nlog.Core().Debug("device limit: total over limit, rejecting",
-		"userID", userID, "ip", sourceIP, "totalIPs", len(allIPs), "limit", limit)
+	if online < limit {
+		return false
+	}
+	nlog.Core().Debug("device limit: over limit, rejecting",
+		"userID", userID, "ip", sourceIP, "online", online, "limit", limit)
 	return true
 }
 

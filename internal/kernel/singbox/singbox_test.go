@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/cedar2025/xboard-node/internal/config"
+	"github.com/cedar2025/xboard-node/internal/kernel"
 	"github.com/sagernet/sing-box/adapter"
 	singM "github.com/sagernet/sing/common/metadata"
 	"golang.org/x/time/rate"
@@ -36,8 +37,6 @@ func TestSingBoxCapabilities(t *testing.T) {
 	}
 }
 
-
-
 type testConn struct {
 	closed bool
 	reads  [][]byte
@@ -60,11 +59,11 @@ func (c *testConn) Write(b []byte) (int, error) {
 	return len(b), nil
 }
 
-func (c *testConn) Close() error { c.closed = true; return nil }
-func (c *testConn) LocalAddr() net.Addr { return &net.TCPAddr{} }
-func (c *testConn) RemoteAddr() net.Addr { return &net.TCPAddr{} }
-func (c *testConn) SetDeadline(time.Time) error { return nil }
-func (c *testConn) SetReadDeadline(time.Time) error { return nil }
+func (c *testConn) Close() error                     { c.closed = true; return nil }
+func (c *testConn) LocalAddr() net.Addr              { return &net.TCPAddr{} }
+func (c *testConn) RemoteAddr() net.Addr             { return &net.TCPAddr{} }
+func (c *testConn) SetDeadline(time.Time) error      { return nil }
+func (c *testConn) SetReadDeadline(time.Time) error  { return nil }
 func (c *testConn) SetWriteDeadline(time.Time) error { return nil }
 
 func testInboundContext(uuid, ip string) adapter.InboundContext {
@@ -149,11 +148,10 @@ func TestConnTrackerCheckDeviceGateMergesFreshGlobalDevices(t *testing.T) {
 	us.addConn("1.1.1.1")
 	tracker.UpdateGlobalDevices(map[int][]string{1: {"9.9.9.9"}})
 
-	if tracker.checkDeviceGate(us, 1, "2.2.2.2", 2) {
-		t.Fatal("expected lexicographically earlier candidate to remain allowed")
-	}
-	if !tracker.checkDeviceGate(us, 1, "99.99.99.99", 2) {
-		t.Fatal("expected merged local+global device state to reject lexicographically later third device")
+	for _, ip := range []string{"2.2.2.2", "99.99.99.99"} {
+		if !tracker.checkDeviceGate(us, 1, ip, 2) {
+			t.Fatalf("expected merged local+global device state to reject third device %s", ip)
+		}
 	}
 	if tracker.checkDeviceGate(us, 1, "1.1.1.1", 2) {
 		t.Fatal("existing local IP should still be allowed")
@@ -211,5 +209,58 @@ func TestConnTrackerRateLimitHonorsContextCancellation(t *testing.T) {
 	cancelWrite()
 	if n, err := writeTracked.Write([]byte("a")); !errors.Is(err, context.Canceled) || n != 0 {
 		t.Fatalf("second Write() = (%d, %v), want (0, context canceled)", n, err)
+	}
+}
+
+func limitedTracker(limit int) *ConnTracker {
+	tracker := NewConnTracker(0)
+	tracker.SetUserMap(map[string]int{"uuid-1": 1})
+	tracker.SetDeviceLimitFunc(func(string) (int, bool) { return limit, true })
+	return tracker
+}
+
+func admitted(tracker *ConnTracker, ip string) (net.Conn, bool) {
+	base := &testConn{}
+	wrapped := tracker.RoutedConnection(context.Background(), base, testInboundContext("uuid-1", ip), nil, nil)
+	return wrapped, wrapped != net.Conn(base)
+}
+
+// Device slots are first come, first served: once the limit is reached a new
+// IP is rejected whatever its sort order.
+func TestConnTrackerFullLimitRejectsLowerSortingIP(t *testing.T) {
+	tracker := limitedTracker(1)
+	if _, ok := admitted(tracker, "9.9.9.9"); !ok {
+		t.Fatal("first device rejected")
+	}
+	if _, ok := admitted(tracker, "1.1.1.1"); ok {
+		t.Error("a second device was admitted over the limit")
+	}
+}
+
+// The panel's global state includes the devices this node reported itself,
+// and trails them: a device that just left this node must not hold its slot
+// against the same user's next IP (Wi-Fi to cellular).
+func TestConnTrackerIgnoresGlobalEchoOfDepartedDevice(t *testing.T) {
+	tracker := limitedTracker(1)
+	old, _ := admitted(tracker, "1.1.1.1")
+	tracker.UpdateGlobalDevices(map[int][]string{1: {"1.1.1.1"}})
+	old.Close()
+
+	if _, ok := admitted(tracker, "2.2.2.2"); !ok {
+		t.Error("new IP rejected because of this node's own stale report")
+	}
+}
+
+// Global state received well after the device left here no longer echoes
+// this node's report: the device is online on another node.
+func TestConnTrackerCountsDepartedDeviceStillOnlineElsewhere(t *testing.T) {
+	tracker := limitedTracker(1)
+	old, _ := admitted(tracker, "1.1.1.1")
+	old.Close()
+	tracker.users[1].departed["1.1.1.1"] = time.Now().Add(-2 * kernel.DeviceEchoWindow)
+	tracker.UpdateGlobalDevices(map[int][]string{1: {"1.1.1.1"}})
+
+	if _, ok := admitted(tracker, "2.2.2.2"); ok {
+		t.Error("a second device was admitted while the first is online on another node")
 	}
 }
