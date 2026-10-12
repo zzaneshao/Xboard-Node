@@ -75,6 +75,7 @@ type LimitDispatcher struct {
 	mu           sync.RWMutex
 	limitedIPs   map[string]map[string]int // email → sourceIP → refcount
 	deviceLimits map[string]int            // email → max devices
+	speedLimits  map[string]int            // email → Mbps, users with a speed limit only
 	emailToUID   map[string]int            // email → panel user ID
 	// departed: when a limited user's IP last went offline here.
 	departed map[string]map[string]time.Time // email → sourceIP → time
@@ -183,7 +184,20 @@ func (d *LimitDispatcher) identifyAndCheck(ctx context.Context) (email, sourceIP
 		nlog.Core().Debug("xray: device limit exceeded", "email", email, "ip", sourceIP)
 		return "", "", false, errors.New("device limit exceeded for " + email)
 	}
+
+	// Splice copy moves bytes in the kernel, past xray-core's rate limiter
+	// and, once the limiter wraps the writer, past the user traffic counter.
+	if d.speedLimited(email) {
+		si.CanSpliceCopy = 3
+	}
 	return email, sourceIP, limited, nil
+}
+
+// speedLimited reports whether email has a speed limit.
+func (d *LimitDispatcher) speedLimited(email string) bool {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	return d.speedLimits[email] > 0
 }
 
 // trackLink records connection lifecycle without mutating xray-core owned
@@ -278,11 +292,12 @@ func (d *LimitDispatcher) Close() error {
 // UpdateLimits replaces the user set and interrupts the live links of users
 // that are no longer present: removing a user from the inbound only stops new
 // handshakes, while established connections and mux sessions would go on.
-func (d *LimitDispatcher) UpdateLimits(emailToUID map[string]int, deviceLimits, _ map[string]int) {
+func (d *LimitDispatcher) UpdateLimits(emailToUID map[string]int, deviceLimits, speedLimits map[string]int) {
 	d.linksMu.Lock()
 	d.mu.Lock()
 	d.emailToUID = emailToUID
 	d.deviceLimits = deviceLimits
+	d.speedLimits = speedLimits
 	d.pruneDeparted(time.Now())
 	d.mu.Unlock()
 	var revoked []trackedLink

@@ -802,8 +802,9 @@ func (x *Xray) updateBandwidthLimits(users []model.UserSpec) {
 }
 
 // updateDispatcherLimits configures the LimitDispatcher with per-user
-// device-limit admission metadata only. Speed limits are enforced by the
-// patched xray-core bandwidth feature.
+// device-limit admission metadata. Speed limits are enforced by the patched
+// xray-core bandwidth feature; the dispatcher only needs to know who has one
+// to keep those connections off splice copy.
 func (x *Xray) updateDispatcherLimits(users []model.UserSpec) {
 	x.mu.Lock()
 	ld := x.limitDispatcher
@@ -814,6 +815,7 @@ func (x *Xray) updateDispatcherLimits(users []model.UserSpec) {
 
 	emailToUID := make(map[string]int, len(users)*2)
 	deviceLimits := make(map[string]int)
+	speedLimits := make(map[string]int)
 
 	for _, u := range users {
 		email := userEmail(u.ID)
@@ -823,9 +825,13 @@ func (x *Xray) updateDispatcherLimits(users []model.UserSpec) {
 			deviceLimits[email] = u.DeviceLimit
 			deviceLimits[u.UUID] = u.DeviceLimit
 		}
+		if u.SpeedLimit > 0 {
+			speedLimits[email] = u.SpeedLimit
+			speedLimits[u.UUID] = u.SpeedLimit
+		}
 	}
 
-	ld.UpdateLimits(emailToUID, deviceLimits, nil)
+	ld.UpdateLimits(emailToUID, deviceLimits, speedLimits)
 }
 
 // xrayCreationMu serialises xrayCore.New() + globalLimitDispatcher capture
