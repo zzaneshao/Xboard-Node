@@ -54,6 +54,8 @@ type SingBox struct {
 	// speedLimitFunc resolves a user UUID to a *rate.Limiter.
 	// Set once by SetSpeedLimitFunc and forwarded to every new ConnTracker.
 	speedLimitFunc func(string) *rate.Limiter
+	// uploadLimitFunc resolves a user UUID to their upload limiter.
+	uploadLimitFunc func(string) *rate.Limiter
 
 	// deviceLimitFunc resolves a user UUID to (limit, hasLimit) for gate-keeping.
 	// Set once by SetDeviceLimitFunc and forwarded to every new ConnTracker.
@@ -146,6 +148,9 @@ func (s *SingBox) Start(nodeConfig *model.NodeSpec, users []model.UserSpec, tls 
 	s.connTracker.SetUserMap(buildUserMap(users))
 	if s.speedLimitFunc != nil {
 		s.connTracker.SetSpeedLimitFunc(s.speedLimitFunc)
+	}
+	if s.uploadLimitFunc != nil {
+		s.connTracker.SetUploadLimitFunc(s.uploadLimitFunc)
 	}
 	if s.deviceLimitFunc != nil {
 		s.connTracker.SetDeviceLimitFunc(s.deviceLimitFunc)
@@ -395,6 +400,16 @@ func (s *SingBox) SetSpeedLimitFunc(fn func(uuid string) *rate.Limiter) {
 	s.speedLimitFunc = fn
 	if s.connTracker != nil {
 		s.connTracker.SetSpeedLimitFunc(fn)
+	}
+}
+
+// SetUploadLimitFunc configures the per-user upload limiter.
+func (s *SingBox) SetUploadLimitFunc(fn func(uuid string) *rate.Limiter) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.uploadLimitFunc = fn
+	if s.connTracker != nil {
+		s.connTracker.SetUploadLimitFunc(fn)
 	}
 }
 

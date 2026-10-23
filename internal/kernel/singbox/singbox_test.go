@@ -181,12 +181,14 @@ func TestConnTrackerCloseByIDClosesTrackedConnection(t *testing.T) {
 func TestConnTrackerRateLimitHonorsContextCancellation(t *testing.T) {
 	tracker := NewConnTracker(0)
 	tracker.SetUserMap(map[string]int{"uuid-1": 1})
-	tracker.SetSpeedLimitFunc(func(uuid string) *rate.Limiter {
+	oneBytePerSecond := func(uuid string) *rate.Limiter {
 		if uuid != "uuid-1" {
 			return nil
 		}
 		return rate.NewLimiter(rate.Limit(1), 1)
-	})
+	}
+	tracker.SetSpeedLimitFunc(oneBytePerSecond)
+	tracker.SetUploadLimitFunc(oneBytePerSecond)
 
 	readCtx, cancelRead := context.WithCancel(context.Background())
 	readBase := &testConn{reads: [][]byte{[]byte("a"), []byte("a")}}
@@ -318,5 +320,30 @@ func TestConnTrackerGlobalEchoDoesNotDisconnectNextDevice(t *testing.T) {
 
 	if base.closed {
 		t.Error("device disconnected because of this node's own stale report")
+	}
+}
+
+func TestConnTrackerLimitsUploadAndDownloadSeparately(t *testing.T) {
+	tracker := NewConnTracker(0)
+	tracker.SetUserMap(map[string]int{"uuid-1": 1})
+	down := rate.NewLimiter(rate.Limit(1), 1000)
+	up := rate.NewLimiter(rate.Limit(1), 1000)
+	tracker.SetSpeedLimitFunc(func(string) *rate.Limiter { return down })
+	tracker.SetUploadLimitFunc(func(string) *rate.Limiter { return up })
+
+	base := &testConn{reads: [][]byte{make([]byte, 300)}}
+	tracked := tracker.RoutedConnection(context.Background(), base, testInboundContext("uuid-1", "1.1.1.1"), nil, nil).(*trackedConn)
+	if _, err := tracked.Read(make([]byte, 300)); err != nil {
+		t.Fatalf("Read() error = %v", err)
+	}
+	if _, err := tracked.Write(make([]byte, 200)); err != nil {
+		t.Fatalf("Write() error = %v", err)
+	}
+
+	if got := up.Tokens(); got > 701 || got < 699 {
+		t.Errorf("upload tokens = %.0f, want 700: reads (uploads) must draw from the upload bucket only", got)
+	}
+	if got := down.Tokens(); got > 801 || got < 799 {
+		t.Errorf("download tokens = %.0f, want 800: writes (downloads) must draw from the download bucket only", got)
 	}
 }

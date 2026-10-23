@@ -148,8 +148,10 @@ type ConnTracker struct {
 
 	idCounter atomic.Int64
 
-	// speedLimitFunc resolves a user UUID to a *rate.Limiter.
+	// speedLimitFunc resolves a user UUID to their download *rate.Limiter.
 	speedLimitFunc atomic.Pointer[func(uuid string) *rate.Limiter]
+	// uploadLimitFunc resolves a user UUID to their upload *rate.Limiter.
+	uploadLimitFunc atomic.Pointer[func(uuid string) *rate.Limiter]
 
 	// deviceLimitFunc resolves a user UUID to their device limit.
 	deviceLimitFunc atomic.Pointer[func(uuid string) (int, bool)]
@@ -187,9 +189,25 @@ func (t *ConnTracker) SetManagedInbound(tag string) {
 	t.usersMu.Unlock()
 }
 
-// SetSpeedLimitFunc configures the per-user speed limit lookup.
+// SetSpeedLimitFunc configures the per-user download limiter lookup.
 func (t *ConnTracker) SetSpeedLimitFunc(fn func(uuid string) *rate.Limiter) {
 	t.speedLimitFunc.Store(&fn)
+}
+
+// SetUploadLimitFunc configures the per-user upload limiter lookup.
+func (t *ConnTracker) SetUploadLimitFunc(fn func(uuid string) *rate.Limiter) {
+	t.uploadLimitFunc.Store(&fn)
+}
+
+// limiters returns uuid's upload and download limiters (nil = unlimited).
+func (t *ConnTracker) limiters(uuid string) (up, down *rate.Limiter) {
+	if f := t.uploadLimitFunc.Load(); f != nil {
+		up = (*f)(uuid)
+	}
+	if f := t.speedLimitFunc.Load(); f != nil {
+		down = (*f)(uuid)
+	}
+	return up, down
 }
 
 // SetDeviceLimitFunc configures the per-user device limit lookup for gate-keeping.
@@ -291,20 +309,18 @@ func (t *ConnTracker) RoutedConnection(
 
 	connID := t.nextID()
 
-	var lim *rate.Limiter
-	if slf := t.speedLimitFunc.Load(); slf != nil {
-		lim = (*slf)(uuid)
-	}
+	upLim, downLim := t.limiters(uuid)
 
 	tracked := &trackedConn{
-		Conn:     conn,
-		tracker:  t,
-		us:       us,
-		userID:   uid,
-		connID:   connID,
-		sourceIP: sourceIP,
-		limiter:  lim,
-		ctx:      ctx,
+		Conn:        conn,
+		tracker:     t,
+		us:          us,
+		userID:      uid,
+		connID:      connID,
+		sourceIP:    sourceIP,
+		upLimiter:   upLim,
+		downLimiter: downLim,
+		ctx:         ctx,
 	}
 	if !t.register(connID, tracked, metadata, uid, sourceIP) {
 		nlog.Core().Debug("singbox: rejecting connection from removed user", "user", uuid, "ip", sourceIP)
@@ -346,20 +362,18 @@ func (t *ConnTracker) RoutedPacketConnection(
 
 	connID := t.nextID()
 
-	var lim *rate.Limiter
-	if slf := t.speedLimitFunc.Load(); slf != nil {
-		lim = (*slf)(uuid)
-	}
+	upLim, downLim := t.limiters(uuid)
 
 	tracked := &trackedPacketConn{
-		PacketConn: conn,
-		tracker:    t,
-		us:         us,
-		userID:     uid,
-		connID:     connID,
-		sourceIP:   sourceIP,
-		limiter:    lim,
-		ctx:        ctx,
+		PacketConn:  conn,
+		tracker:     t,
+		us:          us,
+		userID:      uid,
+		connID:      connID,
+		sourceIP:    sourceIP,
+		upLimiter:   upLim,
+		downLimiter: downLim,
+		ctx:         ctx,
 	}
 	if !t.register(connID, tracked, metadata, uid, sourceIP) {
 		nlog.Core().Debug("singbox: rejecting UDP connection from removed user", "user", uuid, "ip", sourceIP)
@@ -643,14 +657,16 @@ type trackedConn struct {
 	userID   int        // user ID for device tracking
 	connID   string
 	sourceIP string
-	limiter  *rate.Limiter
-	ctx      context.Context
-	closed   atomic.Bool
+	// upLimiter throttles reads (user upload), downLimiter writes (download).
+	upLimiter   *rate.Limiter
+	downLimiter *rate.Limiter
+	ctx         context.Context
+	closed      atomic.Bool
 }
 
 func (c *trackedConn) Read(b []byte) (int, error) {
-	if c.limiter != nil {
-		if burst := c.limiter.Burst(); len(b) > burst {
+	if c.upLimiter != nil {
+		if burst := c.upLimiter.Burst(); len(b) > burst {
 			b = b[:burst]
 		}
 	}
@@ -659,10 +675,10 @@ func (c *trackedConn) Read(b []byte) (int, error) {
 		if c.us != nil {
 			c.us.upload.Add(int64(n)) // 从入站读取 = 用户上传
 		}
-		if c.limiter != nil {
+		if c.upLimiter != nil {
 			// Non-blocking rate limiting
-			if !c.limiter.AllowN(time.Now(), n) {
-				resv := c.limiter.ReserveN(time.Now(), n)
+			if !c.upLimiter.AllowN(time.Now(), n) {
+				resv := c.upLimiter.ReserveN(time.Now(), n)
 				if delay := resv.Delay(); delay > 0 {
 					timer := time.NewTimer(delay)
 					defer timer.Stop()
@@ -682,13 +698,13 @@ func (c *trackedConn) Read(b []byte) (int, error) {
 
 func (c *trackedConn) Write(b []byte) (int, error) {
 	// Apply rate limiting before write
-	if c.limiter != nil {
-		if burst := c.limiter.Burst(); len(b) > burst {
+	if c.downLimiter != nil {
+		if burst := c.downLimiter.Burst(); len(b) > burst {
 			b = b[:burst]
 		}
 		// Non-blocking check first
-		if !c.limiter.AllowN(time.Now(), len(b)) {
-			resv := c.limiter.ReserveN(time.Now(), len(b))
+		if !c.downLimiter.AllowN(time.Now(), len(b)) {
+			resv := c.downLimiter.ReserveN(time.Now(), len(b))
 			if delay := resv.Delay(); delay > 0 {
 				timer := time.NewTimer(delay)
 				defer timer.Stop()
@@ -721,16 +737,16 @@ func (c *trackedConn) Close() error {
 }
 
 // makeCountFunc builds a CountFunc for zero-copy byte counting via sing's
-// ReadCounter/WriteCounter unwrap interfaces.
-func (c *trackedConn) makeCountFunc(counter *atomic.Int64) N.CountFunc {
-	if c.limiter == nil {
+// ReadCounter/WriteCounter unwrap interfaces, throttled by lim when set.
+func (c *trackedConn) makeCountFunc(counter *atomic.Int64, lim *rate.Limiter) N.CountFunc {
+	if lim == nil {
 		return func(n int64) { counter.Add(n) }
 	}
 	return func(n int64) {
 		counter.Add(n)
 		// Non-blocking rate limiting with context cancellation
-		if !c.limiter.AllowN(time.Now(), int(n)) {
-			resv := c.limiter.ReserveN(time.Now(), int(n))
+		if !lim.AllowN(time.Now(), int(n)) {
+			resv := lim.ReserveN(time.Now(), int(n))
 			if delay := resv.Delay(); delay > 0 {
 				timer := time.NewTimer(delay)
 				defer timer.Stop()
@@ -749,14 +765,14 @@ func (c *trackedConn) UnwrapReader() (io.Reader, []N.CountFunc) {
 	if c.us == nil {
 		return c.Conn, nil
 	}
-	return c.Conn, []N.CountFunc{c.makeCountFunc(&c.us.upload)} // 从入站读取 = 用户上传
+	return c.Conn, []N.CountFunc{c.makeCountFunc(&c.us.upload, c.upLimiter)} // 从入站读取 = 用户上传
 }
 
 func (c *trackedConn) UnwrapWriter() (io.Writer, []N.CountFunc) {
 	if c.us == nil {
 		return c.Conn, nil
 	}
-	return c.Conn, []N.CountFunc{c.makeCountFunc(&c.us.download)} // 向入站写入 = 用户下载
+	return c.Conn, []N.CountFunc{c.makeCountFunc(&c.us.download, c.downLimiter)} // 向入站写入 = 用户下载
 }
 
 func (c *trackedConn) Upstream() any           { return c.Conn }
@@ -772,9 +788,11 @@ type trackedPacketConn struct {
 	userID   int
 	connID   string
 	sourceIP string
-	limiter  *rate.Limiter
-	ctx      context.Context
-	closed   atomic.Bool
+	// upLimiter throttles reads (user upload), downLimiter writes (download).
+	upLimiter   *rate.Limiter
+	downLimiter *rate.Limiter
+	ctx         context.Context
+	closed      atomic.Bool
 }
 
 func (c *trackedPacketConn) ReadPacket(buffer *buf.Buffer) (singM.Socksaddr, error) {
@@ -784,10 +802,10 @@ func (c *trackedPacketConn) ReadPacket(buffer *buf.Buffer) (singM.Socksaddr, err
 		if c.us != nil {
 			c.us.upload.Add(n) // 从入站读取 = 用户上传
 		}
-		if c.limiter != nil {
+		if c.upLimiter != nil {
 			// Non-blocking rate limiting with context cancellation
-			if !c.limiter.AllowN(time.Now(), int(n)) {
-				resv := c.limiter.ReserveN(time.Now(), int(n))
+			if !c.upLimiter.AllowN(time.Now(), int(n)) {
+				resv := c.upLimiter.ReserveN(time.Now(), int(n))
 				if delay := resv.Delay(); delay > 0 {
 					timer := time.NewTimer(delay)
 					defer timer.Stop()
@@ -809,9 +827,9 @@ func (c *trackedPacketConn) WritePacket(buffer *buf.Buffer, dest singM.Socksaddr
 	n := int64(buffer.Len())
 
 	// Apply rate limiting before write
-	if c.limiter != nil {
-		if !c.limiter.AllowN(time.Now(), int(n)) {
-			resv := c.limiter.ReserveN(time.Now(), int(n))
+	if c.downLimiter != nil {
+		if !c.downLimiter.AllowN(time.Now(), int(n)) {
+			resv := c.downLimiter.ReserveN(time.Now(), int(n))
 			if delay := resv.Delay(); delay > 0 {
 				timer := time.NewTimer(delay)
 				defer timer.Stop()
@@ -843,15 +861,15 @@ func (c *trackedPacketConn) Close() error {
 	return c.PacketConn.Close()
 }
 
-func (c *trackedPacketConn) makeCountFunc(counter *atomic.Int64) N.CountFunc {
-	if c.limiter == nil {
+func (c *trackedPacketConn) makeCountFunc(counter *atomic.Int64, lim *rate.Limiter) N.CountFunc {
+	if lim == nil {
 		return func(n int64) { counter.Add(n) }
 	}
 	return func(n int64) {
 		counter.Add(n)
 		// Non-blocking rate limiting with context cancellation
-		if !c.limiter.AllowN(time.Now(), int(n)) {
-			resv := c.limiter.ReserveN(time.Now(), int(n))
+		if !lim.AllowN(time.Now(), int(n)) {
+			resv := lim.ReserveN(time.Now(), int(n))
 			if delay := resv.Delay(); delay > 0 {
 				timer := time.NewTimer(delay)
 				defer timer.Stop()
@@ -870,14 +888,14 @@ func (c *trackedPacketConn) UnwrapPacketReader() (N.PacketReader, []N.CountFunc)
 	if c.us == nil {
 		return c.PacketConn, nil
 	}
-	return c.PacketConn, []N.CountFunc{c.makeCountFunc(&c.us.download)}
+	return c.PacketConn, []N.CountFunc{c.makeCountFunc(&c.us.download, c.upLimiter)}
 }
 
 func (c *trackedPacketConn) UnwrapPacketWriter() (N.PacketWriter, []N.CountFunc) {
 	if c.us == nil {
 		return c.PacketConn, nil
 	}
-	return c.PacketConn, []N.CountFunc{c.makeCountFunc(&c.us.upload)}
+	return c.PacketConn, []N.CountFunc{c.makeCountFunc(&c.us.upload, c.downLimiter)}
 }
 
 func (c *trackedPacketConn) Upstream() any           { return c.PacketConn }

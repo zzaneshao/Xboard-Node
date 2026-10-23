@@ -16,6 +16,7 @@ import (
 	"github.com/xtls/xray-core/common/session"
 	"github.com/xtls/xray-core/features/routing"
 	"github.com/xtls/xray-core/transport"
+	"golang.org/x/time/rate"
 
 	"github.com/cedar2025/xboard-node/internal/kernel"
 	"github.com/cedar2025/xboard-node/internal/nlog"
@@ -62,10 +63,10 @@ func limitDispatcherFactory(ctx context.Context, config interface{}) (interface{
 // LimitDispatcher wraps xray's DefaultDispatcher to enforce per-user
 // admission checks before a request is dispatched into xray-core.
 //
-// It intentionally does NOT mutate transport.Link.Reader/Writer. Xray's
-// mux/XUDP close path requires the original concrete *pipe.Reader to remain
-// intact, so the dispatcher is limited to gate-keeping and safe connection
-// lifecycle bookkeeping.
+// It does NOT mutate the links of Dispatch: xray's mux/XUDP close path
+// requires the original concrete *pipe.Reader to remain intact. The only link
+// it touches is the inbound's own link handed to DispatchLink, whose uplink
+// reader it rate-limits for speed-limited users (see limitUplink).
 type LimitDispatcher struct {
 	inner     interface{}        // original DefaultDispatcher (Feature + Dispatcher)
 	innerDisp routing.Dispatcher // same object, typed as Dispatcher
@@ -77,6 +78,9 @@ type LimitDispatcher struct {
 	deviceLimits map[string]int            // email → max devices
 	speedLimits  map[string]int            // email → Mbps, users with a speed limit only
 	emailToUID   map[string]int            // email → panel user ID
+	// uploadLimiters: email → upload limiter of speed-limited users. The
+	// downlink is throttled by xray-core with a separate download limiter.
+	uploadLimiters map[string]*rate.Limiter
 	// departed: when a limited user's IP last went offline here.
 	departed map[string]map[string]time.Time // email → sourceIP → time
 
@@ -156,8 +160,56 @@ func (d *LimitDispatcher) DispatchLink(ctx context.Context, dest net.Destination
 	if email != "" && !d.trackLink(ctx, link, email, sourceIP, limited) {
 		return errUserRemoved
 	}
+	if email != "" && d.speedLimited(email) {
+		d.limitUplink(ctx, link, email)
+	}
 	return d.innerDisp.DispatchLink(ctx, dest, link)
 }
+
+// limitUplink throttles what a speed-limited user sends. xray-core's WrapLink
+// rate-limits only the writer (downlink) of a link handed in through
+// DispatchLink, which is how VLESS dispatches, so uploads ran at full speed.
+// The uplink has its own limiter, so upload and download are each capped at
+// the speed limit, as for sing-box users.
+func (d *LimitDispatcher) limitUplink(ctx context.Context, link *transport.Link, email string) {
+	d.mu.RLock()
+	lim := d.uploadLimiters[email]
+	d.mu.RUnlock()
+	if lim != nil {
+		link.Reader = &rateLimitedReader{Reader: link.Reader, limiter: lim, ctx: ctx}
+	}
+}
+
+// SetUploadLimiters replaces the upload limiters of speed-limited users.
+func (d *LimitDispatcher) SetUploadLimiters(limiters map[string]*rate.Limiter) {
+	d.mu.Lock()
+	d.uploadLimiters = limiters
+	d.mu.Unlock()
+}
+
+// rateLimitedReader waits for limiter tokens for every buffer it reads.
+type rateLimitedReader struct {
+	buf.Reader
+	limiter *rate.Limiter
+	ctx     context.Context
+}
+
+func (r *rateLimitedReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
+	mb, err := r.Reader.ReadMultiBuffer()
+	// WaitN rejects requests above the burst, so wait in burst-sized steps.
+	for n := int(mb.Len()); n > 0; {
+		step := min(n, r.limiter.Burst())
+		if werr := r.limiter.WaitN(r.ctx, step); werr != nil {
+			buf.ReleaseMulti(mb)
+			return nil, werr
+		}
+		n -= step
+	}
+	return mb, err
+}
+
+func (r *rateLimitedReader) Interrupt()   { common.Interrupt(r.Reader) }
+func (r *rateLimitedReader) Close() error { return common.Close(r.Reader) }
 
 // identifyAndCheck extracts user identity from the session context, enforces
 // device limits, and returns the user's email and source IP, plus whether

@@ -253,6 +253,7 @@ func (s *Service) Run(ctx context.Context) error {
 func (s *Service) initialSetup(ctx context.Context) error {
 	// Register speed limit lookup with kernel unconditionally (before push/poll branch).
 	s.kernel.SetSpeedLimitFunc(s.speedTracker.GetLimiter)
+	s.kernel.SetUploadLimitFunc(s.speedTracker.GetUploadLimiter)
 	s.kernel.SetDeviceLimitFunc(s.limiter.GetDeviceLimitByUUID)
 
 	bootstrap, err := s.source.Initial(ctx, s.wsMetrics, s.wsEvents, s.wsStatusCh)

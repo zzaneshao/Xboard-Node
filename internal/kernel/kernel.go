@@ -94,6 +94,9 @@ type Kernel interface {
 	// SetSpeedLimitFunc configures per-user bandwidth throttling.
 	// The function resolves a user UUID to a *rate.Limiter (nil = unlimited).
 	SetSpeedLimitFunc(fn func(uuid string) *rate.Limiter)
+	// SetUploadLimitFunc configures the per-user upload limiter, separate
+	// from the download one set by SetSpeedLimitFunc (nil = unlimited).
+	SetUploadLimitFunc(fn func(uuid string) *rate.Limiter)
 	// SetDeviceLimitFunc configures per-user device limit gate-keeping.
 	// The function resolves a user UUID to (limit, hasLimit).
 	// Kernels that already gate-keep internally (e.g. xray) may no-op.
